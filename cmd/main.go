@@ -10,16 +10,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	"github.com/nats-io/nats.go"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"github.com/akylbek/payment-system/payment-orchestrator/internal/api"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/config"
-	"github.com/akylbek/payment-system/payment-orchestrator/internal/handlers"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/repository"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/service"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/telemetry"
@@ -55,14 +52,7 @@ func main() {
 		Addr: cfg.RedisURL,
 	})
 
-	// Connect to NATS
-	nc, err := nats.Connect(cfg.NatsURL)
-	if err != nil {
-		telemetry.Logger.Fatal("Failed to connect to NATS", zap.Error(err))
-	}
-	defer nc.Close()
-
-	// Connect to Kafka
+	// Connect to Kafka (for publishing state changes to ledger-service)
 	kafkaWriter := &kafka.Writer{
 		Addr:     kafka.TCP(cfg.KafkaBrokers),
 		Topic:    "payment.state.changed",
@@ -70,32 +60,21 @@ func main() {
 	}
 	defer kafkaWriter.Close()
 
-	// Initialize orchestrator service and start consuming
-	orchestrator := service.NewOrchestrator(repo, redisClient, nc, kafkaWriter)
-	go orchestrator.ConsumePaymentEvents(cfg.KafkaBrokers)
+	// Initialize orchestrator service
+	orchestrator := service.NewOrchestrator(repo, redisClient, kafkaWriter, cfg.FraudServiceURL)
 
-	// Initialize handlers
-	stateHandler := handlers.NewPaymentStateHandler(repo)
+	// Start outbox publisher in background
+	outboxCtx, outboxCancel := context.WithCancel(context.Background())
+	defer outboxCancel()
+	go orchestrator.RunOutboxPublisher(outboxCtx)
 
-	// Setup Gin router
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(telemetry.TracingMiddleware())
-
-	// Prometheus metrics endpoint
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
-
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "payment-orchestrator"})
-	})
-
-	r.GET("/payments/:id/state", stateHandler.GetPaymentState)
+	// Setup router with all routes
+	router := api.NewRouter(repo, orchestrator)
 
 	// Setup HTTP server
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Handler: router,
 	}
 
 	// Start server in goroutine
@@ -112,6 +91,10 @@ func main() {
 	<-quit
 
 	telemetry.Logger.Info("Shutting down server...")
+
+	// Stop outbox publisher first
+	outboxCancel()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
