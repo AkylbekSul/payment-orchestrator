@@ -43,3 +43,11 @@ type PaymentStateInfo struct {
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
+
+// OutboxEvent represents an event in the outbox table
+type OutboxEvent struct {
+	ID          int64
+	AggregateID string
+	EventType   string
+	Payload     []byte
+}
