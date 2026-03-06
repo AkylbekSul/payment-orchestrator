@@ -1,8 +1,14 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-COPY . .
+# Copy proto module (needed by replace directive in go.mod)
+COPY proto/ /app/proto/
+
+# Copy service source
+COPY services/payment-orchestrator/ /app/services/payment-orchestrator/
+
+WORKDIR /app/services/payment-orchestrator
 
 RUN go mod download && go mod tidy
 
@@ -14,8 +20,8 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /root/
 
-COPY --from=builder /app/payment-orchestrator .
+COPY --from=builder /app/services/payment-orchestrator/payment-orchestrator .
 
-EXPOSE 8082
+EXPOSE 8082 50051
 
 CMD ["./payment-orchestrator"]

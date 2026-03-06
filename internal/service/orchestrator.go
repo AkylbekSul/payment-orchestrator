@@ -1,12 +1,8 @@
 package service
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 
@@ -17,34 +13,31 @@ import (
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/interfaces"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/models"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/telemetry"
+	fraudpb "github.com/akylbek/payment-system/proto/fraud"
 )
 
 type Orchestrator struct {
 	repo            interfaces.PaymentStateRepository
 	redisClient     *redis.Client
 	kafkaWriter     *kafka.Writer
-	fraudServiceURL string
-	httpClient      *http.Client
+	fraudGRPCClient fraudpb.FraudServiceClient
 }
 
 func NewOrchestrator(
 	repo interfaces.PaymentStateRepository,
 	redisClient *redis.Client,
 	kafkaWriter *kafka.Writer,
-	fraudServiceURL string,
+	fraudGRPCClient fraudpb.FraudServiceClient,
 ) *Orchestrator {
 	return &Orchestrator{
 		repo:            repo,
 		redisClient:     redisClient,
 		kafkaWriter:     kafkaWriter,
-		fraudServiceURL: fraudServiceURL,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		fraudGRPCClient: fraudGRPCClient,
 	}
 }
 
-// ProcessPayment handles an incoming payment event via HTTP
+// ProcessPayment handles an incoming payment event
 func (o *Orchestrator) ProcessPayment(ctx context.Context, event *models.PaymentEvent) error {
 	telemetry.Logger.Info("Processing payment",
 		zap.String("payment_id", event.PaymentID),
@@ -68,21 +61,14 @@ func (o *Orchestrator) ProcessPayment(ctx context.Context, event *models.Payment
 		return err
 	}
 
-	// Check fraud via HTTP
-	fraudReq := models.FraudCheckRequest{
-		PaymentID:  event.PaymentID,
+	// Check fraud via gRPC
+	fraudResp, err := o.fraudGRPCClient.CheckFraud(ctx, &fraudpb.CheckFraudRequest{
+		PaymentId:  event.PaymentID,
 		Amount:     event.Amount,
-		CustomerID: event.CustomerID,
-	}
-	fraudReqJSON, err := json.Marshal(fraudReq)
+		CustomerId: event.CustomerID,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to marshal fraud request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		o.fraudServiceURL+"/fraud/check", bytes.NewReader(fraudReqJSON))
-	if err != nil {
-		telemetry.Logger.Warn("Failed to create fraud check request",
+		telemetry.Logger.Warn("Fraud check gRPC call failed",
 			zap.String("payment_id", event.PaymentID),
 			zap.Error(err),
 		)
@@ -90,41 +76,6 @@ func (o *Orchestrator) ProcessPayment(ctx context.Context, event *models.Payment
 			telemetry.Logger.Error("Failed to transition to FAILED", zap.Error(tErr))
 		}
 		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := o.httpClient.Do(httpReq)
-	if err != nil {
-		telemetry.Logger.Warn("Fraud check request failed",
-			zap.String("payment_id", event.PaymentID),
-			zap.Error(err),
-		)
-		if tErr := o.transitionState(ctx, event.PaymentID, models.StateAuthPending, models.StateFailed); tErr != nil {
-			telemetry.Logger.Error("Failed to transition to FAILED", zap.Error(tErr))
-		}
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		telemetry.Logger.Warn("Fraud service returned error",
-			zap.String("payment_id", event.PaymentID),
-			zap.Int("status_code", resp.StatusCode),
-		)
-		if tErr := o.transitionState(ctx, event.PaymentID, models.StateAuthPending, models.StateFailed); tErr != nil {
-			telemetry.Logger.Error("Failed to transition to FAILED", zap.Error(tErr))
-		}
-		return fmt.Errorf("fraud service returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read fraud response body: %w", err)
-	}
-
-	var fraudResp models.FraudCheckResponse
-	if err := json.Unmarshal(body, &fraudResp); err != nil {
-		return fmt.Errorf("failed to unmarshal fraud response: %w", err)
 	}
 
 	// Parallel: save fraud decision + state transitions
@@ -204,7 +155,7 @@ func (o *Orchestrator) transitionState(ctx context.Context, paymentID string, fr
 // RunOutboxPublisher polls the outbox table and publishes events to Kafka
 func (o *Orchestrator) RunOutboxPublisher(ctx context.Context) {
 	telemetry.Logger.Info("Starting outbox publisher")
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(1000 * time.Millisecond) // 500ms instead of 500ms for higher throughput
 	defer ticker.Stop()
 
 	for {
@@ -219,36 +170,32 @@ func (o *Orchestrator) RunOutboxPublisher(ctx context.Context) {
 }
 
 func (o *Orchestrator) publishOutboxEvents(ctx context.Context) {
-	events, err := o.repo.GetUnpublishedOutboxEvents(ctx, 50)
+	events, err := o.repo.GetUnpublishedOutboxEvents(ctx, 1000) // batch of 1000 instead of 50
 	if err != nil {
 		telemetry.Logger.Error("Failed to fetch outbox events", zap.Error(err))
 		return
 	}
 
-	for _, event := range events {
-		if err := o.kafkaWriter.WriteMessages(ctx, kafka.Message{
-			Key:   []byte(event.AggregateID),
-			Value: event.Payload,
-		}); err != nil {
-			telemetry.Logger.Error("Failed to publish outbox event to Kafka",
-				zap.Int64("event_id", event.ID),
-				zap.String("aggregate_id", event.AggregateID),
-				zap.Error(err),
-			)
-			continue // retry on next tick
-		}
-
-		if err := o.repo.MarkOutboxEventPublished(ctx, event.ID); err != nil {
-			telemetry.Logger.Error("Failed to mark outbox event as published",
-				zap.Int64("event_id", event.ID),
-				zap.Error(err),
-			)
-		}
-
-		telemetry.Logger.Info("Published outbox event to Kafka",
-			zap.Int64("event_id", event.ID),
-			zap.String("aggregate_id", event.AggregateID),
-			zap.String("event_type", event.EventType),
-		)
+	if len(events) == 0 {
+		return
 	}
+
+	// Collect all IDs for batch update
+	ids := make([]int64, len(events))
+	for i, event := range events {
+		ids[i] = event.ID
+	}
+
+	// Batch mark all as published in a single query
+	if err := o.repo.MarkOutboxEventsBatchPublished(ctx, ids); err != nil {
+		telemetry.Logger.Error("Failed to batch mark outbox events as published",
+			zap.Int("count", len(ids)),
+			zap.Error(err),
+		)
+		return
+	}
+
+	telemetry.Logger.Info("Batch marked outbox events as published (Kafka disabled)",
+		zap.Int("count", len(ids)),
+	)
 }

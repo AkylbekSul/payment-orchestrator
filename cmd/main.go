@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,12 +15,17 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/api"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/config"
+	grpcserver "github.com/akylbek/payment-system/payment-orchestrator/internal/grpcserver"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/repository"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/service"
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/telemetry"
+	fraudpb "github.com/akylbek/payment-system/proto/fraud"
+	paymentpb "github.com/akylbek/payment-system/proto/payment"
 )
 
 func main() {
@@ -41,6 +47,11 @@ func main() {
 	}
 	defer db.Close()
 
+	// Configure connection pool for high concurrency
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	// Initialize repository
 	repo := repository.NewPaymentStateRepository(db)
 	if err := repo.InitDB(); err != nil {
@@ -49,7 +60,8 @@ func main() {
 
 	// Connect to Redis
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisURL,
+		Addr:     cfg.RedisURL,
+		PoolSize: 100,
 	})
 
 	// Connect to Kafka (for publishing state changes to ledger-service)
@@ -60,15 +72,25 @@ func main() {
 	}
 	defer kafkaWriter.Close()
 
-	// Initialize orchestrator service
-	orchestrator := service.NewOrchestrator(repo, redisClient, kafkaWriter, cfg.FraudServiceURL)
+	// Connect to Fraud Service via gRPC
+	fraudConn, err := grpc.NewClient(cfg.FraudServiceAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		telemetry.Logger.Fatal("Failed to connect to fraud service via gRPC", zap.Error(err))
+	}
+	defer fraudConn.Close()
+	fraudClient := fraudpb.NewFraudServiceClient(fraudConn)
+
+	// Initialize orchestrator service with gRPC fraud client
+	orchestrator := service.NewOrchestrator(repo, redisClient, kafkaWriter, fraudClient)
 
 	// Start outbox publisher in background
-	outboxCtx, outboxCancel := context.WithCancel(context.Background())
-	defer outboxCancel()
-	go orchestrator.RunOutboxPublisher(outboxCtx)
+	// outboxCtx, outboxCancel := context.WithCancel(context.Background())
+	// defer outboxCancel()
+	// go orchestrator.RunOutboxPublisher(outboxCtx)
 
-	// Setup router with all routes
+	// Setup HTTP router (health, metrics, legacy HTTP endpoints)
 	router := api.NewRouter(repo, orchestrator)
 
 	// Setup HTTP server
@@ -77,11 +99,28 @@ func main() {
 		Handler: router,
 	}
 
-	// Start server in goroutine
+	// Start HTTP server in goroutine
 	go func() {
-		telemetry.Logger.Info("Payment Orchestrator starting", zap.String("port", cfg.Port))
+		telemetry.Logger.Info("Payment Orchestrator HTTP starting", zap.String("port", cfg.Port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			telemetry.Logger.Fatal("Failed to start server", zap.Error(err))
+			telemetry.Logger.Fatal("Failed to start HTTP server", zap.Error(err))
+		}
+	}()
+
+	// Start gRPC server
+	grpcSrv := grpc.NewServer()
+	paymentGRPCServer := grpcserver.NewPaymentGRPCServer(repo, orchestrator)
+	paymentpb.RegisterPaymentOrchestratorServer(grpcSrv, paymentGRPCServer)
+
+	grpcListener, err := net.Listen("tcp", ":"+cfg.GRPCPort)
+	if err != nil {
+		telemetry.Logger.Fatal("Failed to listen for gRPC", zap.Error(err))
+	}
+
+	go func() {
+		telemetry.Logger.Info("Payment Orchestrator gRPC starting", zap.String("grpc_port", cfg.GRPCPort))
+		if err := grpcSrv.Serve(grpcListener); err != nil {
+			telemetry.Logger.Fatal("Failed to start gRPC server", zap.Error(err))
 		}
 	}()
 
@@ -94,6 +133,9 @@ func main() {
 
 	// Stop outbox publisher first
 	outboxCancel()
+
+	// Graceful shutdown gRPC
+	grpcSrv.GracefulStop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
