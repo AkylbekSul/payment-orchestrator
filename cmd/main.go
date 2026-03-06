@@ -86,9 +86,9 @@ func main() {
 	orchestrator := service.NewOrchestrator(repo, redisClient, kafkaWriter, fraudClient)
 
 	// Start outbox publisher in background
-	// outboxCtx, outboxCancel := context.WithCancel(context.Background())
-	// defer outboxCancel()
-	// go orchestrator.RunOutboxPublisher(outboxCtx)
+	outboxCtx, outboxCancel := context.WithCancel(context.Background())
+	defer outboxCancel()
+	go orchestrator.RunOutboxPublisher(outboxCtx)
 
 	// Setup HTTP router (health, metrics, legacy HTTP endpoints)
 	router := api.NewRouter(repo, orchestrator)

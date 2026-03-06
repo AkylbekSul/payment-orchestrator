@@ -170,7 +170,7 @@ func (o *Orchestrator) RunOutboxPublisher(ctx context.Context) {
 }
 
 func (o *Orchestrator) publishOutboxEvents(ctx context.Context) {
-	events, err := o.repo.GetUnpublishedOutboxEvents(ctx, 1000) // batch of 1000 instead of 50
+	events, err := o.repo.GetUnpublishedOutboxEvents(ctx, 1000)
 	if err != nil {
 		telemetry.Logger.Error("Failed to fetch outbox events", zap.Error(err))
 		return
@@ -180,22 +180,35 @@ func (o *Orchestrator) publishOutboxEvents(ctx context.Context) {
 		return
 	}
 
-	// Collect all IDs for batch update
-	ids := make([]int64, len(events))
+	// Build Kafka messages from outbox events
+	messages := make([]kafka.Message, len(events))
 	for i, event := range events {
-		ids[i] = event.ID
+		messages[i] = kafka.Message{
+			Key:   []byte(event.AggregateID),
+			Value: event.Payload,
+		}
 	}
 
-	// Batch mark all as published in a single query
-	if err := o.repo.MarkOutboxEventsBatchPublished(ctx, ids); err != nil {
-		telemetry.Logger.Error("Failed to batch mark outbox events as published",
-			zap.Int("count", len(ids)),
+	// Publish batch to Kafka
+	if err := o.kafkaWriter.WriteMessages(ctx, messages...); err != nil {
+		telemetry.Logger.Error("Failed to publish outbox events to Kafka",
+			zap.Int("count", len(messages)),
 			zap.Error(err),
 		)
 		return
 	}
 
-	telemetry.Logger.Info("Batch marked outbox events as published (Kafka disabled)",
-		zap.Int("count", len(ids)),
+	// Mark each event as published
+	for _, event := range events {
+		if err := o.repo.MarkOutboxEventPublished(ctx, event.ID); err != nil {
+			telemetry.Logger.Error("Failed to mark outbox event as published",
+				zap.Int64("event_id", event.ID),
+				zap.Error(err),
+			)
+		}
+	}
+
+	telemetry.Logger.Info("Published outbox events to Kafka",
+		zap.Int("count", len(events)),
 	)
 }

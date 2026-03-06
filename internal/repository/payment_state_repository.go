@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/models"
@@ -174,28 +172,5 @@ func (r *PaymentStateRepository) MarkOutboxEventPublished(ctx context.Context, i
 		UPDATE outbox_events SET published = TRUE, published_at = NOW()
 		WHERE id = $1
 	`, id)
-	return err
-}
-
-// MarkOutboxEventsBatchPublished marks multiple outbox events as published in a single query
-func (r *PaymentStateRepository) MarkOutboxEventsBatchPublished(ctx context.Context, ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	// Build placeholders: $1, $2, $3, ...
-	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		args[i] = id
-	}
-
-	query := fmt.Sprintf(`
-		UPDATE outbox_events SET published = TRUE, published_at = NOW()
-		WHERE id IN (%s)
-	`, strings.Join(placeholders, ","))
-
-	_, err := r.db.ExecContext(ctx, query, args...)
 	return err
 }

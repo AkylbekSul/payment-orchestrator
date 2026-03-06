@@ -15,5 +15,4 @@ type PaymentStateRepository interface {
 	GetByPaymentID(ctx context.Context, paymentID string) (*models.PaymentStateInfo, error)
 	GetUnpublishedOutboxEvents(ctx context.Context, limit int) ([]models.OutboxEvent, error)
 	MarkOutboxEventPublished(ctx context.Context, id int64) error
-	MarkOutboxEventsBatchPublished(ctx context.Context, ids []int64) error
 }
