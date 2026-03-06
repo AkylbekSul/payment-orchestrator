@@ -1,9 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 
-	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/handlers"
@@ -12,24 +12,27 @@ import (
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/telemetry"
 )
 
-func NewRouter(repo interfaces.PaymentStateRepository, orchestrator *service.Orchestrator) *gin.Engine {
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(telemetry.TracingMiddleware())
+func NewRouter(repo interfaces.PaymentStateRepository, orchestrator *service.Orchestrator) http.Handler {
+	mux := http.NewServeMux()
 
 	// Prometheus metrics
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// Health check
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "payment-orchestrator"})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "payment-orchestrator"})
 	})
 
 	// Payment routes
 	paymentHandler := handlers.NewPaymentHandler(repo, orchestrator)
-	r.GET("/payments/:id/state", paymentHandler.GetPaymentState)
-	r.POST("/payments/process", paymentHandler.ProcessPayment)
+	mux.HandleFunc("GET /payments/{id}/state", paymentHandler.GetPaymentState)
+	mux.HandleFunc("POST /payments/process", paymentHandler.ProcessPayment)
 
-	return r
+	// Apply global middleware
+	var handler http.Handler = mux
+	handler = telemetry.TracingMiddleware(handler)
+	handler = telemetry.RecoveryMiddleware(handler)
+
+	return handler
 }

@@ -2,9 +2,9 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 
-	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/interfaces"
@@ -25,21 +25,27 @@ func NewPaymentHandler(repo interfaces.PaymentStateRepository, orchestrator *ser
 	}
 }
 
-func (h *PaymentHandler) GetPaymentState(c *gin.Context) {
-	paymentID := c.Param("id")
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
 
-	info, err := h.repo.GetByPaymentID(c.Request.Context(), paymentID)
+func (h *PaymentHandler) GetPaymentState(w http.ResponseWriter, r *http.Request) {
+	paymentID := r.PathValue("id")
+
+	info, err := h.repo.GetByPaymentID(r.Context(), paymentID)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Payment state not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Payment state not found"})
 		return
 	}
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch payment state"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch payment state"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"payment_id":     paymentID,
 		"state":          info.State,
 		"previous_state": info.PreviousState,
@@ -49,27 +55,27 @@ func (h *PaymentHandler) GetPaymentState(c *gin.Context) {
 	})
 }
 
-func (h *PaymentHandler) ProcessPayment(c *gin.Context) {
+func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
 	var event models.PaymentEvent
-	if err := c.ShouldBindJSON(&event); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
 		telemetry.Logger.Error("Error decoding payment event", zap.Error(err))
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
 
-	if err := h.orchestrator.ProcessPayment(c.Request.Context(), &event); err != nil {
+	if err := h.orchestrator.ProcessPayment(r.Context(), &event); err != nil {
 		telemetry.Logger.Error("Error processing payment",
 			zap.String("payment_id", event.PaymentID),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusInternalServerError, gin.H{
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error":      "Failed to process payment",
 			"payment_id": event.PaymentID,
 		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	writeJSON(w, http.StatusOK, map[string]string{
 		"status":     "processed",
 		"payment_id": event.PaymentID,
 	})

@@ -3,10 +3,10 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -33,7 +33,7 @@ func InitTelemetry(serviceName string) error {
 	config := zap.NewProductionConfig()
 	config.EncoderConfig.TimeKey = "timestamp"
 	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	
+
 	var err error
 	Logger, err = config.Build()
 	if err != nil {
@@ -94,50 +94,77 @@ func Shutdown(ctx context.Context) error {
 	return Logger.Sync()
 }
 
-// TracingMiddleware adds tracing and logging to Gin routes
-func TracingMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
+// statusResponseWriter wraps http.ResponseWriter to capture the status code
+type statusResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *statusResponseWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// TracingMiddleware adds tracing and logging to HTTP routes
+func TracingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Extract trace context from headers
-		ctx := otel.GetTextMapPropagator().Extract(c.Request.Context(), propagation.HeaderCarrier(c.Request.Header))
-		
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+
 		// Start new span
-		ctx, span := Tracer.Start(ctx, fmt.Sprintf("%s %s", c.Request.Method, c.FullPath()))
+		ctx, span := Tracer.Start(ctx, fmt.Sprintf("%s %s", r.Method, r.URL.Path))
 		defer span.End()
 
 		// Add trace context to request
-		c.Request = c.Request.WithContext(ctx)
+		r = r.WithContext(ctx)
 
 		// Add trace ID to response headers
 		spanCtx := span.SpanContext()
 		if spanCtx.IsValid() {
-			c.Header("X-Trace-ID", spanCtx.TraceID().String())
+			w.Header().Set("X-Trace-ID", spanCtx.TraceID().String())
 		}
 
 		// Record request start time
 		start := time.Now()
-		
+
+		// Wrap response writer to capture status code
+		sw := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
 		// Process request
-		c.Next()
-		
+		next.ServeHTTP(sw, r)
+
 		// Calculate duration
 		duration := time.Since(start)
 
 		// Add span attributes
 		span.SetAttributes(
-			semconv.HTTPMethodKey.String(c.Request.Method),
-			semconv.HTTPRouteKey.String(c.FullPath()),
-			semconv.HTTPStatusCodeKey.Int(c.Writer.Status()),
-			attribute.String("http.client_ip", c.ClientIP()),
+			semconv.HTTPMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String(r.URL.Path),
+			semconv.HTTPStatusCodeKey.Int(sw.statusCode),
+			attribute.String("http.client_ip", r.RemoteAddr),
 		)
 
 		// Log request
 		Logger.Info("HTTP request",
-			zap.String("method", c.Request.Method),
-			zap.String("path", c.Request.URL.Path),
-			zap.Int("status", c.Writer.Status()),
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.Int("status", sw.statusCode),
 			zap.Duration("duration", duration),
 			zap.String("trace_id", spanCtx.TraceID().String()),
-			zap.String("client_ip", c.ClientIP()),
+			zap.String("client_ip", r.RemoteAddr),
 		)
-	}
+	})
+}
+
+// RecoveryMiddleware recovers from panics and returns 500
+func RecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				Logger.Error("Panic recovered", zap.Any("error", err))
+				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }

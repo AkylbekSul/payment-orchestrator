@@ -131,8 +131,8 @@ func main() {
 
 	telemetry.Logger.Info("Shutting down server...")
 
-	// Stop outbox publisher first
-	outboxCancel()
+	// Stop outbox publisher first (uncomment when outbox is enabled)
+	// outboxCancel()
 
 	// Graceful shutdown gRPC
 	grpcSrv.GracefulStop()
