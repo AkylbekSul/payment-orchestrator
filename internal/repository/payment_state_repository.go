@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/akylbek/payment-system/payment-orchestrator/internal/models"
+	"go.uber.org/zap"
 )
 
 type PaymentStateRepository struct {
@@ -76,7 +77,11 @@ func (r *PaymentStateRepository) TransitionStateWithOutbox(ctx context.Context, 
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+			zap.Error(err)
+		}
+	}()
 
 	// 1. Update state
 	result, err := tx.ExecContext(ctx, `

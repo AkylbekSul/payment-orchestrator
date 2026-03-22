@@ -47,7 +47,7 @@ func (o *Orchestrator) ProcessPayment(ctx context.Context, event *models.Payment
 	lockKey := fmt.Sprintf("payment_lock:%s", event.PaymentID)
 	locked := o.redisClient.SetNX(ctx, lockKey, "1", 30*time.Second)
 	if !locked.Val() {
-		return fmt.Errorf("payment %s is already being processed", event.PaymentID)
+		return nil
 	}
 	defer o.redisClient.Del(ctx, lockKey)
 

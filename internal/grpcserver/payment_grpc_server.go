@@ -35,7 +35,15 @@ func (s *PaymentGRPCServer) ProcessPayment(ctx context.Context, req *paymentpb.P
 		zap.Float64("amount", req.Amount),
 	)
 
-	createdAt, _ := time.Parse(time.RFC3339, req.CreatedAt)
+	createdAt, err := time.Parse(time.RFC3339, req.CreatedAt)
+	if err != nil {
+		telemetry.Logger.Error("Failed to parse CreatedAt timestamp in gRPC request",
+			zap.String("payment_id", req.PaymentId),
+			zap.String("created_at_raw", req.CreatedAt),
+			zap.Error(err),
+		)
+		createdAt = time.Now()
+	}
 
 	event := &models.PaymentEvent{
 		PaymentID:  req.PaymentId,
@@ -64,9 +72,16 @@ func (s *PaymentGRPCServer) ProcessPayment(ctx context.Context, req *paymentpb.P
 func (s *PaymentGRPCServer) GetPaymentState(ctx context.Context, req *paymentpb.GetPaymentStateRequest) (*paymentpb.GetPaymentStateResponse, error) {
 	info, err := s.repo.GetByPaymentID(ctx, req.PaymentId)
 	if err == sql.ErrNoRows {
+		telemetry.Logger.Warn("Payment state not found via gRPC",
+			zap.String("payment_id", req.PaymentId),
+		)
 		return nil, status.Errorf(codes.NotFound, "payment state not found")
 	}
 	if err != nil {
+		telemetry.Logger.Error("Failed to fetch payment state via gRPC",
+			zap.String("payment_id", req.PaymentId),
+			zap.Error(err),
+		)
 		return nil, status.Errorf(codes.Internal, "failed to fetch payment state: %v", err)
 	}
 

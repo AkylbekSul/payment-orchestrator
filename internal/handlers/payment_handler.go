@@ -35,6 +35,10 @@ func (h *PaymentHandler) GetPaymentState(c *gin.Context) {
 	}
 
 	if err != nil {
+		telemetry.Logger.Error("Failed to fetch payment state",
+			zap.String("payment_id", paymentID),
+			zap.Error(err),
+		)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch payment state"})
 		return
 	}
